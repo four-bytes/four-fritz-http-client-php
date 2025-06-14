@@ -211,11 +211,16 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for deta
 ## 🔮 Roadmap
 
 - [ ] **File Upload Support** - Complete NAS upload functionality
-- [ ] **WLAN Service** - WiFi configuration management
-- [ ] **Call Service** - Call history and phone management
-- [ ] **Smart Home Service** - DECT device control
 - [ ] **System Service** - Device information and monitoring
-- [ ] **TR-064 Support** - SOAP-based services integration
+- [ ] **Call Service** - Basic call history, basic answer machine and alarm control
+- [ ] **WIFI Settings** - Enable / disable, WPS push setup
+
+## 💡 Ideas
+
+~~- [ ] **Smart Home Service** - DECT device control~~
+~~- [ ] **WLAN Service** - WiFi configuration management~~
+~~- [ ] **Call Service** - Call history and phone management~~
+~~- [ ] **TR-064 Support** - SOAP-based services integration~~
 
 ## 📄 License
 
