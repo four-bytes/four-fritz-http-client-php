@@ -235,4 +235,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**Made with ❤️ by [4 Bytes, Four Flames GmbH & Co. KG](https://github.com/four-bytes)**
+**Made with ❤️ by [4 Bytes](https://github.com/four-bytes)**
