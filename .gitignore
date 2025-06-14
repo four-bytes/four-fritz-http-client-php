@@ -1,0 +1,28 @@
+# Dependencies
+/vendor/
+composer.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files
+.phpunit.result.cache
+/tests/coverage/
+
+# Log files
+*.log
+
+# Configuration files with credentials
+config.json
+fritzbox-config.json
+
+# Temporary files
+/tmp/
+*.tmp
