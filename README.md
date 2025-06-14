@@ -217,10 +217,10 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for deta
 
 ## 💡 Ideas
 
-~~- [ ] **Smart Home Service** - DECT device control~~
-~~- [ ] **WLAN Service** - WiFi configuration management~~
-~~- [ ] **Call Service** - Call history and phone management~~
-~~- [ ] **TR-064 Support** - SOAP-based services integration~~
+- **Smart Home Service** - DECT device control
+- **WLAN Service** - WiFi configuration management
+- **Call Service** - Call history and phone management
+- **TR-064 Support** - SOAP-based services integratio
 
 ## 📄 License
 
