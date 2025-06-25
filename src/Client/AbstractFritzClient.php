@@ -35,7 +35,16 @@ abstract class AbstractFritzClient implements FritzClientInterface
         if (!empty($this->config['myfritz_url'])) {
             $this->myfritzUrl = rtrim($this->config['myfritz_url'], '/');
         } else {
-            $this->myfritzUrl = 'https://' . $this->config['ip'];
+            // Handle IP with optional port
+            $ip = $this->config['ip'];
+            if (!str_contains($ip, '://')) {
+                // Add protocol if not present
+                $useHttps = $this->config['use_https'] ?? true;
+                $protocol = $useHttps ? 'https://' : 'http://';
+                $this->myfritzUrl = $protocol . $ip;
+            } else {
+                $this->myfritzUrl = $ip;
+            }
         }
         
         $this->username = $this->config['username'];
@@ -154,7 +163,6 @@ abstract class AbstractFritzClient implements FritzClientInterface
         ]);
         
         $ch = curl_init();
-        
         if ($method === 'POST') {
             $postData = http_build_query($params);
             curl_setopt_array($ch, [
