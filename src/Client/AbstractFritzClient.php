@@ -17,7 +17,17 @@ abstract class AbstractFritzClient implements FritzClientInterface
     protected int $sessionExpiry = 0;
     protected array $config;
     protected LoggerInterface $logger;
-    
+
+    /**
+     * Non-fatal cURL errno values where a buffered response body is still usable.
+     * errno 56 (CURLE_RECV_ERROR) is triggered by FritzBox/MyFRITZ when the
+     * server sends "Connection: close" and resets the TCP connection immediately
+     * after the response body. PHP libcurl raises the error even though all bytes
+     * have been received. We capture the body via CURLOPT_WRITEFUNCTION and
+     * treat these errors as soft failures.
+     */
+    private const CURL_SOFT_ERRORS = [56]; // CURLE_RECV_ERROR
+
     public function __construct(array $config, LoggerInterface $logger)
     {
         $this->config = array_merge([
@@ -28,9 +38,9 @@ abstract class AbstractFritzClient implements FritzClientInterface
             'timeout' => 30,
             'max_retries' => 3
         ], $config);
-        
+
         $this->logger = $logger;
-        
+
         // Prefer MyFRITZ URL if provided, otherwise use IP with HTTPS
         if (!empty($this->config['myfritz_url'])) {
             $this->myfritzUrl = rtrim($this->config['myfritz_url'], '/');
@@ -46,11 +56,11 @@ abstract class AbstractFritzClient implements FritzClientInterface
                 $this->myfritzUrl = $ip;
             }
         }
-        
+
         $this->username = $this->config['username'];
         $this->password = $this->config['password'];
     }
-    
+
     public function isReachable(): bool
     {
         $ch = curl_init();
@@ -62,13 +72,13 @@ abstract class AbstractFritzClient implements FritzClientInterface
             CURLOPT_TIMEOUT => 10,
             CURLOPT_USERAGENT => 'Four-Fritz-HttpClient/1.0'
         ]);
-        
-        $response = curl_exec($ch);
+
+        $response = $this->curlExec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $error = curl_error($ch);
         curl_close($ch);
-        
-        if ($httpCode === 200) {
+
+        if ($httpCode === 200 && $response !== false && $response !== '') {
             // Check for active BlockTime
             if (preg_match('/<BlockTime>(\d+)<\/BlockTime>/', $response, $matches)) {
                 $blockTime = (int)$matches[1];
@@ -79,39 +89,34 @@ abstract class AbstractFritzClient implements FritzClientInterface
             }
             return true;
         }
-        
+
         $this->logger->error("FritzBox not reachable: HTTP $httpCode - $error");
         return false;
     }
-    
+
     public function authenticate(): bool
     {
         $this->logger->info("Starting authentication process", [
             'url' => $this->myfritzUrl,
             'username' => $this->username ?: '(password-only)'
         ]);
-        
-        if (!$this->isReachable()) {
-            $this->logger->error("FritzBox not reachable, cannot authenticate");
-            return false;
-        }
-        
+
         try {
-            // Get login state using official AVM endpoint
+            // Get login state using official AVM endpoint (also verifies reachability)
             $this->logger->debug("Getting login state from FritzBox");
             $loginState = $this->getLoginState();
-            
+
             $this->logger->debug("Login state received", [
                 'challenge' => substr($loginState['challenge'], 0, 20) . '...',
                 'blocktime' => $loginState['blocktime'],
                 'sid' => $loginState['sid']
             ]);
-            
+
             if ($loginState['blocktime'] > 0) {
                 $this->logger->warning("Rate limited! BlockTime: {$loginState['blocktime']} seconds");
                 return false;
             }
-            
+
             // Calculate response based on challenge type
             if ($this->isPbkdf2($loginState['challenge'])) {
                 $this->logger->info("Using PBKDF2 method (FritzOS 7.24+)");
@@ -120,27 +125,27 @@ abstract class AbstractFritzClient implements FritzClientInterface
                 $this->logger->info("Using MD5 method (legacy)");
                 $challengeResponse = $this->calculateMd5Response($loginState['challenge'], $this->password);
             }
-            
+
             // Send response and get SID
             $sid = $this->sendAuthResponse($this->username, $challengeResponse);
-            
+
             if ($sid === '0000000000000000') {
                 $this->logger->error("Authentication failed - wrong credentials");
                 return false;
             }
-            
+
             $this->sessionId = $sid;
             $this->sessionExpiry = time() + (20 * 60);
             $this->logger->info("Authentication successful. SID: {$this->sessionId}");
             $this->saveSidToFile();
             return true;
-            
+
         } catch (\Exception $e) {
             $this->logger->error("Authentication error: " . $e->getMessage());
             return false;
         }
     }
-    
+
     /**
      * Central method for making LUA API requests to FritzBox
      */
@@ -150,18 +155,18 @@ abstract class AbstractFritzClient implements FritzClientInterface
             $this->logger->error("No valid session for LUA request", ['endpoint' => $endpoint]);
             return null;
         }
-        
+
         // Add session ID to parameters
         $params['sid'] = $this->sessionId;
-        
+
         $url = $this->myfritzUrl . $endpoint;
-        
+
         $this->logger->debug("Making LUA API request", [
             'url' => $url,
             'method' => $method,
             'params' => array_merge($params, ['sid' => '***']) // Hide SID in logs
         ]);
-        
+
         $ch = curl_init();
         if ($method === 'POST') {
             $postData = http_build_query($params);
@@ -174,7 +179,7 @@ abstract class AbstractFritzClient implements FritzClientInterface
             $url .= '?' . http_build_query($params);
             curl_setopt($ch, CURLOPT_URL, $url);
         }
-        
+
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_SSL_VERIFYPEER => false,
@@ -183,20 +188,20 @@ abstract class AbstractFritzClient implements FritzClientInterface
             CURLOPT_USERAGENT => 'Four-Fritz-HttpClient/1.0',
             CURLOPT_FOLLOWLOCATION => true
         ]);
-        
-        $response = curl_exec($ch);
+
+        $response = $this->curlExec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlError = curl_error($ch);
         curl_close($ch);
-        
+
         $this->logger->debug("LUA API response", [
             'httpCode' => $httpCode,
             'curlError' => $curlError,
-            'responseLength' => strlen($response),
+            'responseLength' => is_string($response) ? strlen($response) : 0,
             'endpoint' => $endpoint
         ]);
-        
-        if ($httpCode !== 200 || !$response) {
+
+        if ($httpCode !== 200 || $response === false || $response === '') {
             $this->logger->error("LUA API request failed", [
                 'httpCode' => $httpCode,
                 'curlError' => $curlError,
@@ -204,7 +209,7 @@ abstract class AbstractFritzClient implements FritzClientInterface
             ]);
             return null;
         }
-        
+
         // Try to decode as JSON
         $data = json_decode($response, true);
         if (json_last_error() !== JSON_ERROR_NONE) {
@@ -216,10 +221,10 @@ abstract class AbstractFritzClient implements FritzClientInterface
             // Return raw response for non-JSON endpoints (like file downloads)
             return ['_raw_response' => $response, '_http_code' => $httpCode];
         }
-        
+
         return $data;
     }
-    
+
     /**
      * Make a file download request (returns raw content)
      */
@@ -228,12 +233,12 @@ abstract class AbstractFritzClient implements FritzClientInterface
         if (!$this->ensureValidSession()) {
             return null;
         }
-        
+
         $params['sid'] = $this->sessionId;
         $url = $this->myfritzUrl . $endpoint . '?' . http_build_query($params);
-        
+
         $this->logger->debug("Making file download request", ['url' => $url]);
-        
+
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
@@ -244,13 +249,13 @@ abstract class AbstractFritzClient implements FritzClientInterface
             CURLOPT_USERAGENT => 'Four-Fritz-HttpClient/1.0',
             CURLOPT_FOLLOWLOCATION => true
         ]);
-        
-        $response = curl_exec($ch);
+
+        $response = $this->curlExec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlError = curl_error($ch);
         curl_close($ch);
-        
-        if ($httpCode !== 200 || $response === false) {
+
+        if ($httpCode !== 200 || $response === false || $response === '') {
             $this->logger->error("File download failed", [
                 'httpCode' => $httpCode,
                 'curlError' => $curlError,
@@ -258,10 +263,10 @@ abstract class AbstractFritzClient implements FritzClientInterface
             ]);
             return null;
         }
-        
+
         return $response;
     }
-    
+
     /**
      * Ensure we have a valid session ID
      */
@@ -273,22 +278,66 @@ abstract class AbstractFritzClient implements FritzClientInterface
                 return true;
             }
         }
-        
+
         // Try to load SID from file
         if ($this->loadSidFromFile()) {
             if ($this->testSidValidity()) {
                 return true;
             }
         }
-        
+
         // Need to authenticate
         return $this->authenticate();
     }
-    
+
+    /**
+     * Execute a cURL handle and return the response body.
+     *
+     * FritzBox (and MyFRITZ) sends "Connection: close" and resets the TCP
+     * connection immediately after the response body. PHP libcurl (with
+     * OpenSSL) raises CURLE_RECV_ERROR (56) on that reset even though all
+     * response bytes have been received. We capture the body via
+     * CURLOPT_WRITEFUNCTION so we can return it despite the soft error.
+     *
+     * @return string|false  The response body, or false on a hard failure
+     *                       where no data was received at all.
+     */
+    private function curlExec(\CurlHandle $ch): string|false
+    {
+        $buffer = '';
+
+        curl_setopt($ch, CURLOPT_WRITEFUNCTION, static function (\CurlHandle $ch, string $data) use (&$buffer): int {
+            $buffer .= $data;
+            return strlen($data);
+        });
+
+        $result = curl_exec($ch);
+        $errno  = curl_errno($ch);
+
+        // Hard failure: curl_exec returned false AND we got nothing in the buffer
+        if ($result === false && $buffer === '' && !in_array($errno, self::CURL_SOFT_ERRORS, true)) {
+            return false;
+        }
+
+        // Soft failure (e.g. errno 56): body was already buffered via WRITEFUNCTION
+        // Return whatever we buffered; callers will validate based on HTTP status code.
+        if ($buffer !== '') {
+            return $buffer;
+        }
+
+        // curl_exec succeeded and returned a string (should not happen when
+        // CURLOPT_WRITEFUNCTION is set, but handle defensively)
+        if (is_string($result) && $result !== '') {
+            return $result;
+        }
+
+        return false;
+    }
+
     private function getLoginState(): array
     {
         $url = $this->myfritzUrl . '/login_sid.lua?version=2';
-        
+
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
@@ -298,74 +347,74 @@ abstract class AbstractFritzClient implements FritzClientInterface
             CURLOPT_TIMEOUT => $this->config['timeout'],
             CURLOPT_USERAGENT => 'Four-Fritz-HttpClient/1.0'
         ]);
-        
-        $response = curl_exec($ch);
+
+        $response = $this->curlExec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        
-        if ($httpCode !== 200 || !$response) {
+
+        if ($httpCode !== 200 || $response === false || $response === '') {
             throw new \Exception("Failed to get login state (HTTP $httpCode)");
         }
-        
+
         $xml = simplexml_load_string($response);
         if ($xml === false) {
             throw new \Exception("Invalid XML response");
         }
-        
+
         return [
             'challenge' => (string)$xml->Challenge,
             'blocktime' => (int)$xml->BlockTime,
             'sid' => (string)$xml->SID
         ];
     }
-    
+
     private function isPbkdf2(string $challenge): bool
     {
         return str_starts_with($challenge, '2$');
     }
-    
+
     private function calculatePbkdf2Response(string $challenge, string $password): string
     {
         $parts = explode('$', $challenge);
-        
+
         if (count($parts) !== 5) {
             throw new \Exception("Invalid PBKDF2 challenge format");
         }
-        
+
         $iter1 = (int)$parts[1];
         $salt1 = hex2bin($parts[2]);
         $iter2 = (int)$parts[3];
         $salt2 = hex2bin($parts[4]);
-        
+
         // Hash twice as per AVM specification
         $hash1 = hash_pbkdf2('sha256', $password, $salt1, $iter1, 32, true);
         $hash2 = hash_pbkdf2('sha256', $hash1, $salt2, $iter2, 32, true);
-        
+
         return $parts[4] . '$' . bin2hex($hash2);
     }
-    
+
     private function calculateMd5Response(string $challenge, string $password): string
     {
         // Official AVM method: challenge-password
         $responseInput = $challenge . '-' . $password;
-        
+
         // Convert to UTF-16LE as per AVM specification
         $utf16le = mb_convert_encoding($responseInput, 'UTF-16LE', 'UTF-8');
-        
+
         // Calculate MD5 and return in correct format
         $md5Hash = md5($utf16le);
         return $challenge . '-' . $md5Hash;
     }
-    
+
     private function sendAuthResponse(string $username, string $challengeResponse): string
     {
         $url = $this->myfritzUrl . '/login_sid.lua?version=2';
-        
+
         $postData = http_build_query([
             'username' => $username,
             'response' => $challengeResponse
         ]);
-        
+
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
@@ -377,31 +426,31 @@ abstract class AbstractFritzClient implements FritzClientInterface
             CURLOPT_TIMEOUT => $this->config['timeout'],
             CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded']
         ]);
-        
-        $response = curl_exec($ch);
+
+        $response = $this->curlExec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        
-        if ($httpCode !== 200 || !$response) {
+
+        if ($httpCode !== 200 || $response === false || $response === '') {
             throw new \Exception("Failed to send auth response (HTTP $httpCode)");
         }
-        
+
         $xml = simplexml_load_string($response);
         if ($xml === false) {
             throw new \Exception("Invalid XML response");
         }
-        
+
         return (string)$xml->SID;
     }
-    
+
     private function testSidValidity(): bool
     {
         if (empty($this->sessionId)) {
             return false;
         }
-        
+
         $testUrl = $this->myfritzUrl . '/login_sid.lua?version=2&sid=' . $this->sessionId;
-        
+
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $testUrl,
@@ -411,12 +460,12 @@ abstract class AbstractFritzClient implements FritzClientInterface
             CURLOPT_TIMEOUT => 10,
             CURLOPT_USERAGENT => 'Four-Fritz-HttpClient/1.0'
         ]);
-        
-        $response = curl_exec($ch);
+
+        $response = $this->curlExec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        
-        if ($httpCode === 200 && $response) {
+
+        if ($httpCode === 200 && $response !== false && $response !== '') {
             if (preg_match('/<SID>(.*?)<\/SID>/', $response, $matches)) {
                 $returnedSid = $matches[1];
                 if ($returnedSid !== '0000000000000000' && $returnedSid === $this->sessionId) {
@@ -424,12 +473,12 @@ abstract class AbstractFritzClient implements FritzClientInterface
                 }
             }
         }
-        
+
         $this->sessionId = '';
         $this->sessionExpiry = 0;
         return false;
     }
-    
+
     private function saveSidToFile(): void
     {
         $sidFile = sys_get_temp_dir() . '/fritzbox_sid_' . md5($this->myfritzUrl . $this->username) . '.json';
@@ -441,37 +490,37 @@ abstract class AbstractFritzClient implements FritzClientInterface
         ];
         file_put_contents($sidFile, json_encode($data), LOCK_EX);
     }
-    
+
     private function loadSidFromFile(): bool
     {
         $sidFile = sys_get_temp_dir() . '/fritzbox_sid_' . md5($this->myfritzUrl . $this->username) . '.json';
-        
+
         if (!file_exists($sidFile)) {
             return false;
         }
-        
+
         $data = json_decode(file_get_contents($sidFile), true);
         if (!$data || !isset($data['sid'], $data['expiry'])) {
             return false;
         }
-        
+
         // Check if SID is for the same user and URL
         if ($data['username'] !== $this->username || $data['url'] !== $this->myfritzUrl) {
             return false;
         }
-        
+
         // Check if not expired
         if (time() >= $data['expiry']) {
             unlink($sidFile);
             return false;
         }
-        
+
         $this->sessionId = $data['sid'];
         $this->sessionExpiry = $data['expiry'];
         $this->logger->info("Loaded valid SID from cache");
         return true;
     }
-    
+
     public function getStatus(): array
     {
         return [
